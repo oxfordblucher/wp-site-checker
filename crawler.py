@@ -1,6 +1,6 @@
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse, urlencode, parse_qs
 import argparse
 import json
 import sys
@@ -11,7 +11,7 @@ errors = []
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "InternalHealthCheckBot/1.0"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 })
 
 def login(login_file):
@@ -35,6 +35,8 @@ def login(login_file):
             payload[name] = creds["username"]
         elif name == "pwd":
             payload[name] = creds["password"]
+        elif name is None:
+            continue
         else:
             payload[name] = value
 
