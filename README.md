@@ -1,12 +1,24 @@
-# Authenticated Web Health Checker
+# site-health-checker
 
-## About the Project
-This is a script that allows the user to crawl a website and check the frontend of all its pages. The idea is to recursively check for any HTML errors for a Wordpress site after any updates and/or code changes. At the moment, we are only checking for HTML errors but the intention is to expand the functionality to check for any errors that still result in a 200 and so forth.
+This is a CLI tool for checking website health built with Python.
 
-Authentication is optional and only necessary in the event that the website being tested has content pages gated behind a login. In that case, please use a json file with the following keys:
+## installation
 
-"login_url", (the action URL of the applicable login form)
+This is installed by downloading/cloning the repo and running ``pipx install`` within its directory on your machine.
 
-"username",
+## usage
 
-"password"
+Run ``shcheck {website url}``
+
+
+| Options | Function |
+| ------- | -------- |
+| -d, --delay | sets delay in seconds, defaults to 0.1 |
+| -t, --timeout | sets timeout in seconds, defaults to 10 |
+| -o, --output | optional filepath destination for output file |
+| -e, --excluded | comma separated values of paths to exclude |
+| -lf, --login-file | location for login credential JSON {login_url, username, password} |
+| -c, --cookie | pass authentication cookie payload directly into session header |
+| -sm, --sitemap | exact sitemap path if you know it, may allow for faster crawling |
+| -sp, --spider | boolean for forcing spider crawl |
+| -w, --workers | Number of simultaneous processes |

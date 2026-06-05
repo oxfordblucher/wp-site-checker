@@ -1,146 +1,268 @@
 import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse, urlunparse, urlencode, parse_qs
 import argparse
 import json
 import sys
 import time
+import csv
+import re
+import collections
+import concurrent.futures
+import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse, urlunparse, urlencode, parse_qs
 
-visited = set()
-errors = []
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-})
+class SiteHealthChecker:
+    def __init__(self, args):
+        self.base_url = args.url
+        self.delay = args.delay
+        self.timeout = args.timeout
+        self.output = args.output
+        self.max_workers = args.workers
+        self.spider = args.spider
+        
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        })
 
-def login(login_file):
-    """Login using credentials from JSON file."""
-    try:
-        with open(login_file, "r") as f:
-            creds = json.load(f)
-    except Exception as e:
-        print(f"Failed to read login file: {e}")
-        sys.exit(1)
+        self.visited = set()
+        self.errors = []
 
-    resp = session.get(creds["login_url"])
-    soup = BeautifulSoup(resp.text, "html.parser")
-    form = soup.find("form")
+        self.exclude_patterns = self._compile_exclude_patterns(args.exclude)
 
-    payload = {}
-    for input_tag in form.find_all("input"):
-        name = input_tag.get("name")
-        value = input_tag.get("value", "")
-        if name == "log":
-            payload[name] = creds["username"]
-        elif name == "pwd":
-            payload[name] = creds["password"]
-        elif name is None:
-            continue
-        else:
-            payload[name] = value
+        if args.cookie:
+            self._load_cookie(args.cookie)
+        elif args.login_file:
+            self._login(args.login_file)
 
-    resp = session.post(
-        creds["login_url"],
-        data=payload,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Referer": creds["login_url"]
-        },
-        timeout=10
-    )
-    resp.raise_for_status()
-    print("Login final URL:", resp.url)
-    print("Redirects:", [r.status_code for r in resp.history])
-    print(session.cookies.get_dict())
 
-def normalize_url(url):
-    parsed = urlparse(url)
+    def _compile_exclude_patterns(self, patterns):
+        blocked_paths = [
+            "/logout",
+            "/wp-admin",
+            "/wp-json",
+            "/download",
+            "/wp-content",
+            "?action="
+        ]
+        if patterns:
+            blocked_paths.extend([p.strip() for p in patterns.split(",") if p.strip()])
+        return [re.compile(re.escape(p)) for p in blocked_paths]
 
-    path = parsed.path.rstrip("/")
 
-    return urlunparse((
-        parsed.scheme,
-        parsed.netloc,
-        path,
-        parsed.params,
-        parsed.query,
-        ""
-    ))
+    def _load_cookie(self, cookie_str):
+        """Allows direct injection of an authentication cookie payload string into header"""
+        print("[*] Loading cookie from string...")
+        if "=" in cookie_str:
+            name, value = cookie_str.split("=", 1)
+            self.session.cookies.set(name.strip(), value.strip(), domain=urlparse(self.base_url).netloc)
 
-def is_internal(url, base_url):
-    return urlparse(url).netloc == urlparse(base_url).netloc
 
-BLOCKED_PATHS = (
-    "/logout",
-    "/wp-admin",
-    "/wp-json",
-    "/download",
-    "/wp-content",
-    "?action="
-)
+    def _login(self, login_file):
+        """Login using credentials from JSON file."""
+        try:
+            with open(login_file, "r") as f:
+                creds = json.load(f)
+        except Exception as e:
+            print(f"Failed to read login file: {e}")
+            sys.exit(1)
 
-def is_allowed(url, base_url):
-    if not is_internal(url, base_url):
-        return False
-    
-    for blocked in BLOCKED_PATHS:
-        if blocked in url:
+        resp = self.session.get(creds["login_url"])
+        soup = BeautifulSoup(resp.text, "html.parser")
+        form = soup.find("form")
+        if not form:
+            print("Login form not found on the page.")
+            sys.exit(1)
+
+        payload = {}
+        for input_tag in form.find_all("input"):
+            name = input_tag.get("name")
+            if name in creds:
+                payload[name] = creds[name]
+            else:
+                payload[name] = input_tag.get("value", "")
+
+        resp = self.session.post(
+            creds["login_url"],
+            data=payload,
+            headers={
+                "Referer": creds["login_url"]
+            },
+            timeout=self.timeout
+        )
+        resp.raise_for_status()
+        print("Login final URL:", resp.url)
+        print("Redirects:", [r.status_code for r in resp.history])
+
+    def is_allowed(self, url):
+        if not self.is_internal(url, self.base_url):
             return False
         
-    return True
-
-def crawl(url, base_url):
-    url = normalize_url(url)
-
-    if url in visited:
-        return
+        for blocked in self.exclude_patterns:
+            if blocked.search(url):
+                return False
+            
+        return True
     
-    print(f"Crawling: {url}")
-    visited.add(url)
 
-    time.sleep(0.5)
+    def normalize_url(self, url):
+        parsed = urlparse(url)
 
-    try:
-        resp = session.get(url, timeout=10)
-    except requests.RequestException as e:
-        errors.append((url, str(e)))
-        return
-    
-    status = resp.status_code
-    if status >= 400:
-        errors.append((url, status))
-        return
-    
-    if "text/html" not in resp.headers.get("Content-Type", ""):
-        return
-    
-    soup = BeautifulSoup(resp.text, "html.parser")
-    for link in soup.find_all("a", href=True):
-        if link["href"].startswith("#"):
-            continue
+        path = parsed.path.rstrip("/")
 
-        next_url = urljoin(url, link["href"])
-        if is_allowed(next_url, base_url):
-            crawl(next_url, base_url)
+        return urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            path,
+            parsed.params,
+            parsed.query,
+            ""
+        ))
+    
+
+    def is_internal(self, url, base_url):
+        return urlparse(url).netloc == urlparse(base_url).netloc
+
+
+    def discover_links(self, url: str | None):
+        """Discover links from the given sitemap URL or will scan for them."""
+        sitemap_paths = [url] if url else["/sitemap.xml", "/sitemap_index.xml", "/wp-sitemap.xml"]
+        discovered = set()
+
+        for path in sitemap_paths:
+            target = urljoin(self.base_url, path)
+            links = self._extract_links(target)
+            if links:
+                discovered.update(links)
+                break
+
+        if not discovered:
+            print("No sitemap found, crawling from homepage...")
+            discovered.add(self.normalize_url(self.base_url))
+
+        return [u for u in discovered if self.is_allowed(u)]
+
+
+    def _extract_links(self, sitemap_url):
+        """Recursively extract links from a sitemap XML."""
+        urls = set()
+        try:
+            resp = self.session.get(sitemap_url, timeout=self.timeout)
+            if resp.status_code != 200:
+                return urls
+            root = ET.fromstring(resp.content)
+            ns = {"ns": root.tag.split("}")[0].strip("{")} if "}" in root.tag else {}
+
+            submaps = root.findall(".//ns:sitemap/ns:loc", ns) if ns else root.findall(".//sitemap/loc")
+            if submaps:
+                for sub in submaps:
+                    urls.update(self._extract_links(sub.text.strip()))
+            else:
+                locs = root.findall(".//ns:url/ns:loc", ns) if ns else root.findall(".//url/loc")
+                for loc in locs:
+                    urls.add(loc.text.strip())
+        except Exception:
+            pass
+        return urls
+
+
+    def crawl(self, url):
+
+        time.sleep(self.delay)
+        found_links = []
+
+        try:
+            resp = self.session.get(url, timeout=self.timeout)
+            if resp.status_code >= 400:
+                self.errors.append((url, resp.status_code))
+                return []
+            
+            if self.spider and "text/html" in resp.headers.get("Content-Type", ""):
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for link in soup.find_all("a", href=True):
+                    if link["href"].startswith("#") or link["href"].startswith("javascript:"):
+                        continue
+
+                    next_url = self.normalize_url(urljoin(url, link["href"]))
+                    if self.is_allowed(next_url):
+                        found_links.append(next_url)
+
+        except requests.RequestException as e:
+            self.errors.append((url, str(e)))
+        
+        return found_links
+
+    
+    def run(self, sitemap_url: str | None, output_file: str | None):
+        initial_urls = self.discover_links(sitemap_url)
+        queue = collections.deque(initial_urls)
+        
+        enqueued = set(initial_urls)
+        self.visited.update(initial_urls)
+
+        print(f"Starting crawl with up to {self.max_workers} workers...")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            to_dos = {}
+
+            while queue or to_dos:
+                while queue:
+                    target = queue.popleft()
+                    future = executor.submit(self.crawl, target)
+                    to_dos[future] = target
+
+                done, _ = concurrent.futures.wait(to_dos.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
+                for completed in done:
+                    url = to_dos.pop(completed)
+                    try:
+                        new_links = completed.result()
+                        for link in new_links:
+                            if link not in self.visited and link not in enqueued:
+                                queue.append(link)
+                                enqueued.add(link)
+                                self.visited.add(link)
+                    except Exception as e:
+                        self.errors.append((url, str(e)))
+
+        self.generate_report(output_file)
+        return len(self.errors) == 0
+    
+
+    def generate_report(self, output_file):
+        if self.errors:
+            print("\nErrors encountered during crawl:")
+            for url, status in self.errors:
+                print(f"{url} - {status}")
+        if output_file:
+            try:
+                with open(output_file, mode="w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["URL", "Status"])
+                    for url, status in self.errors:
+                        writer.writerow([url, status])
+            except Exception as e:
+                print(f"Failed to write report: {e}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Simple authenticated web crawler")
     parser.add_argument("url", help="Base URL of the site to crawl")
-    parser.add_argument("--login-file", help="JSON file with login credentials", default=None)
+    parser.add_argument("-w", "--workers", help="Simultaneous workers", type=int, default=5)
+    parser.add_argument("-d", "--delay", help="Delay between requests to be polite", type=float, default=0.1)
+    parser.add_argument("-t", "--timeout", help="Request timeout", type=int, default=10)
+    parser.add_argument("-o", "--output", help="Optional output filepath destination")
+    parser.add_argument("-e", "--exclude", help="Comma-separated list of paths to exclude")
+    parser.add_argument("-lf", "--login-file", help="JSON file with login credentials")
+    parser.add_argument("-c", "--cookie", help="Pass authentication cookie payload into request header")
+    parser.add_argument("-sm", "--sitemap", help="Optional path to sitemap. Format: /sitemap.xml")
+    parser.add_argument("-sp", "--spider", help="Force spidering mode without sitemap discovery", action="store_true")
     args = parser.parse_args()
+    checker = SiteHealthChecker(args)
 
-    if args.login_file:
-        login(args.login_file)
+    success = checker.run(sitemap_url = args.sitemap, output_file = args.output)
+    sys.exit(0 if success else 1)
 
-    crawl(args.url, args.url)
-
-    if errors:
-        print("\nErrors found:")
-        for url, status in errors:
-            print(status, url)
-    else:
-        print("No errors found.")
 
 if __name__ == "__main__":
     main()
