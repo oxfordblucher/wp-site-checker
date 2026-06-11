@@ -10,6 +10,7 @@ import concurrent.futures
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlunparse, urlencode, parse_qs
+from importlib.metadata import version
 
 
 class SiteHealthChecker:
@@ -57,6 +58,9 @@ class SiteHealthChecker:
         if "=" in cookie_str:
             name, value = cookie_str.split("=", 1)
             self.session.cookies.set(name.strip(), value.strip(), domain=urlparse(self.base_url).netloc)
+        else:
+            print("Error: --cookie must be in NAME=VALUE format")
+            sys.exit(1)
 
 
     def _login(self, login_file):
@@ -92,6 +96,9 @@ class SiteHealthChecker:
             timeout=self.timeout
         )
         resp.raise_for_status()
+        if resp.url == creds["login_url"] or "login" in resp.url:
+            print("Login failed, redirected back to login page")
+            sys.exit(1)
         print("Login final URL:", resp.url)
         print("Redirects:", [r.status_code for r in resp.history])
 
@@ -144,9 +151,14 @@ class SiteHealthChecker:
         return [u for u in discovered if self.is_allowed(u)]
 
 
-    def _extract_links(self, sitemap_url):
+    def _extract_links(self, sitemap_url, _visited=None):
         """Recursively extract links from a sitemap XML."""
+        if _visited is None:
+            _visited = set()
         urls = set()
+        if sitemap_url in _visited:
+            return urls
+        
         try:
             resp = self.session.get(sitemap_url, timeout=self.timeout)
             if resp.status_code != 200:
@@ -157,7 +169,7 @@ class SiteHealthChecker:
             submaps = root.findall(".//ns:sitemap/ns:loc", ns) if ns else root.findall(".//sitemap/loc")
             if submaps:
                 for sub in submaps:
-                    urls.update(self._extract_links(sub.text.strip()))
+                    urls.update(self._extract_links(sub.text.strip(), _visited))
             else:
                 locs = root.findall(".//ns:url/ns:loc", ns) if ns else root.findall(".//url/loc")
                 for loc in locs:
@@ -169,13 +181,13 @@ class SiteHealthChecker:
 
     def crawl(self, url):
 
-        time.sleep(self.delay)
         found_links = []
 
         try:
+            time.sleep(self.delay)
             resp = self.session.get(url, timeout=self.timeout)
             if resp.status_code >= 400:
-                self.errors.append((url, resp.status_code))
+                self.errors.append((url, resp.status_code, resp.reason))
                 return []
             
             if self.spider and "text/html" in resp.headers.get("Content-Type", ""):
@@ -189,7 +201,7 @@ class SiteHealthChecker:
                         found_links.append(next_url)
 
         except requests.RequestException as e:
-            self.errors.append((url, str(e)))
+            self.errors.append((url, None, str(e)))
         
         return found_links
 
@@ -207,7 +219,7 @@ class SiteHealthChecker:
             to_dos = {}
 
             while queue or to_dos:
-                while queue:
+                while queue and len(to_dos) < self.max_workers * 2:
                     target = queue.popleft()
                     future = executor.submit(self.crawl, target)
                     to_dos[future] = target
@@ -223,7 +235,7 @@ class SiteHealthChecker:
                                 enqueued.add(link)
                                 self.visited.add(link)
                     except Exception as e:
-                        self.errors.append((url, str(e)))
+                        self.errors.append((url, None, str(e)))
 
         self.generate_report(output_file)
         return len(self.errors) == 0
@@ -232,15 +244,15 @@ class SiteHealthChecker:
     def generate_report(self, output_file):
         if self.errors:
             print("\nErrors encountered during crawl:")
-            for url, status in self.errors:
-                print(f"{url} - {status}")
+            for url, status, message in self.errors:
+                print(f"{url} - {status} - {message}")
         if output_file:
             try:
                 with open(output_file, mode="w", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     writer.writerow(["URL", "Status"])
-                    for url, status in self.errors:
-                        writer.writerow([url, status])
+                    for url, status, message in self.errors:
+                        writer.writerow([url, status, message])
             except Exception as e:
                 print(f"Failed to write report: {e}")
 
@@ -257,6 +269,7 @@ def main():
     parser.add_argument("-c", "--cookie", help="Pass authentication cookie payload into request header")
     parser.add_argument("-sm", "--sitemap", help="Optional path to sitemap. Format: /sitemap.xml")
     parser.add_argument("-sp", "--spider", help="Force spidering mode without sitemap discovery", action="store_true")
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {version('site-health-checker')}")
     args = parser.parse_args()
     checker = SiteHealthChecker(args)
 
